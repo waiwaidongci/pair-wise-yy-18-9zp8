@@ -1,174 +1,15 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const config = require('./project.config');
+const db = require('./lib/db');
+const store = require('./lib/recordStore');
+const correctionStore = require('./lib/correctionStore');
+const correctionService = require('./lib/correctionService');
 
 const app = express();
 const PORT = process.env.PORT || config.port;
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'app.db');
 
 app.use(express.json({ limit: '2mb' }));
-
-function sqlValue(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return "'" + String(value).replaceAll("'", "''") + "'";
-}
-
-function runSql(sql) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  return execFileSync('sqlite3', [DB_FILE], {
-    input: sql,
-    encoding: 'utf8'
-  });
-}
-
-function select(sql) {
-  const output = runSql('.mode json\n' + sql);
-  if (!output.trim()) return [];
-  return JSON.parse(output);
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function toRecord(row) {
-  const data = JSON.parse(row.data || '{}');
-  return {
-    id: row.id,
-    collection: row.collection,
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...data
-  };
-}
-
-function findCollection(name) {
-  const collection = config.collections[name];
-  if (!collection) {
-    const error = new Error('unknown collection: ' + name);
-    error.status = 404;
-    throw error;
-  }
-  return collection;
-}
-
-function titleFor(collectionConfig, data) {
-  return (collectionConfig.titleFields || [])
-    .map((field) => data[field])
-    .filter(Boolean)
-    .join(' / ') || data.name || data.title || data.code || '';
-}
-
-function validate(collectionConfig, data) {
-  const missing = (collectionConfig.required || []).filter((field) => data[field] === undefined || data[field] === '');
-  if (missing.length) {
-    const error = new Error('missing required fields: ' + missing.join(', '));
-    error.status = 400;
-    throw error;
-  }
-}
-
-function insertEvent({ recordId, collection, action, status, actor, note, data }) {
-  runSql(
-    'INSERT INTO events (id, record_id, collection, action, status, actor, note, data, created_at) VALUES (' +
-    [
-      sqlValue(randomUUID()),
-      sqlValue(recordId),
-      sqlValue(collection),
-      sqlValue(action || '记录'),
-      sqlValue(status || ''),
-      sqlValue(actor || ''),
-      sqlValue(note || ''),
-      sqlValue(JSON.stringify(data || {})),
-      sqlValue(now())
-    ].join(', ') +
-    ');'
-  );
-}
-
-function initDb() {
-  runSql(`
-CREATE TABLE IF NOT EXISTS records (
-  id TEXT PRIMARY KEY,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL,
-  title TEXT NOT NULL,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection);
-CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  record_id TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  action TEXT NOT NULL,
-  status TEXT,
-  actor TEXT,
-  note TEXT,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_record ON events(record_id);
-`);
-
-  const count = select('SELECT COUNT(*) AS count FROM records;')[0].count;
-  if (count > 0) return;
-
-  for (const seed of config.seed || []) {
-    const collectionConfig = findCollection(seed.collection);
-    const id = seed.id || randomUUID();
-    const createdAt = seed.createdAt || now();
-    const status = seed.status || collectionConfig.defaultStatus || '';
-    const data = { ...seed.data, status };
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(seed.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(seed.updatedAt || createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
-      recordId: id,
-      collection: seed.collection,
-      action: seed.eventAction || '创建',
-      status,
-      actor: seed.actor || 'system',
-      note: seed.note || '',
-      data
-    });
-  }
-}
-
-function loadRecord(collection, id) {
-  const rows = select(
-    'SELECT * FROM records WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ' LIMIT 1;'
-  );
-  return rows[0] ? toRecord(rows[0]) : null;
-}
-
-function saveRecord(collection, id, data, status) {
-  const collectionConfig = findCollection(collection);
-  runSql(
-    'UPDATE records SET status = ' + sqlValue(status) +
-    ', title = ' + sqlValue(titleFor(collectionConfig, data)) +
-    ', data = ' + sqlValue(JSON.stringify(data)) +
-    ', updated_at = ' + sqlValue(now()) +
-    ' WHERE collection = ' + sqlValue(collection) + ' AND id = ' + sqlValue(id) + ';'
-  );
-}
 
 function applyQuery(records, query) {
   return records.filter((record) => {
@@ -186,7 +27,95 @@ function applyQuery(records, query) {
   });
 }
 
-initDb();
+// ---------- 纠错单接口入口（独立于通用档案入口） ----------
+
+// 纠错单列表：/api/corrections?status=待审&targetCollection=puppetHeads&targetId=...
+app.get('/api/corrections', (req, res, next) => {
+  try {
+    const rows = correctionStore.listCorrections({
+      status: req.query.status,
+      targetCollection: req.query.targetCollection,
+      targetId: req.query.targetId
+    });
+    const limit = Number(req.query.limit || 0);
+    res.json(limit > 0 ? rows.slice(0, limit) : rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 提交纠错单：同一件只留一份待审；重复提交沿用首次结果；
+// 凭证缺失或新值与当前档案相同则退回。
+app.post('/api/corrections', (req, res, next) => {
+  try {
+    const result = correctionService.submit(req.body || {});
+    if (result.reused) {
+      // 重复提交：返回首次处理结果，不新建单据
+      return res.status(200).json({ reused: true, ...result.correction });
+    }
+    if (result.rejected) {
+      // 凭证缺失或新值与当前档案相同：单据留档为已退回
+      return res.status(422).json({ reused: false, ...result.correction });
+    }
+    return res.status(201).json({ reused: false, ...result.correction });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 纠错单详情（含目标档案当前值与审核履历）
+app.get('/api/corrections/:id', (req, res, next) => {
+  try {
+    const correction = correctionStore.loadCorrection(req.params.id);
+    if (!correction) return res.status(404).json({ error: 'not found' });
+    const target = store.loadRecord(correction.targetCollection, correction.targetId);
+    const events = store.listEvents(req.params.id);
+    res.json({
+      ...correction,
+      targetCurrent: target
+        ? {
+            id: target.id,
+            collection: correction.targetCollection,
+            status: target.status,
+            fields: Object.fromEntries(
+              correction.changes.map((change) => [change.field, target[change.field] ?? null])
+            )
+          }
+        : null,
+      events
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/corrections/:id/approve', (req, res, next) => {
+  try {
+    const result = correctionService.approve(
+      req.params.id,
+      String((req.body || {}).actor || '').trim(),
+      (req.body || {}).reviewNote
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/corrections/:id/reject', (req, res, next) => {
+  try {
+    const result = correctionService.reject(
+      req.params.id,
+      String((req.body || {}).actor || '').trim(),
+      (req.body || {}).reviewNote
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ---------- 通用档案接口 ----------
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: config.title, port: PORT });
@@ -197,16 +126,15 @@ app.get('/api/meta', (req, res) => {
     title: config.title,
     description: config.description,
     collections: config.collections,
+    corrections: config.corrections,
     examples: config.examples || []
   });
 });
 
 app.get('/api/:collection', (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const rows = select(
-      'SELECT * FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' ORDER BY updated_at DESC;'
-    ).map(toRecord);
+    store.findCollection(req.params.collection);
+    const rows = store.listRecords(req.params.collection);
     const filtered = applyQuery(rows, req.query);
     const limit = Number(req.query.limit || 0);
     res.json(limit > 0 ? filtered.slice(0, limit) : filtered);
@@ -217,27 +145,14 @@ app.get('/api/:collection', (req, res, next) => {
 
 app.post('/api/:collection', (req, res, next) => {
   try {
-    const collectionConfig = findCollection(req.params.collection);
+    const collectionConfig = store.findCollection(req.params.collection);
     const data = { ...collectionConfig.defaults, ...req.body };
     const status = data.status || collectionConfig.defaultStatus || '';
     data.status = status;
-    validate(collectionConfig, data);
+    store.validate(collectionConfig, data);
     const id = randomUUID();
-    const createdAt = now();
-    runSql(
-      'INSERT INTO records (id, collection, status, title, data, created_at, updated_at) VALUES (' +
-      [
-        sqlValue(id),
-        sqlValue(req.params.collection),
-        sqlValue(status),
-        sqlValue(titleFor(collectionConfig, data)),
-        sqlValue(JSON.stringify(data)),
-        sqlValue(createdAt),
-        sqlValue(createdAt)
-      ].join(', ') +
-      ');'
-    );
-    insertEvent({
+    store.insertRecord({ collection: req.params.collection, id, data, status });
+    store.insertEvent({
       recordId: id,
       collection: req.params.collection,
       action: req.body.action || '创建',
@@ -246,7 +161,7 @@ app.post('/api/:collection', (req, res, next) => {
       note: req.body.note || '',
       data
     });
-    res.status(201).json(loadRecord(req.params.collection, id));
+    res.status(201).json(store.loadRecord(req.params.collection, id));
   } catch (error) {
     next(error);
   }
@@ -254,8 +169,8 @@ app.post('/api/:collection', (req, res, next) => {
 
 app.get('/api/:collection/:id', (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    store.findCollection(req.params.collection);
+    const record = store.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     res.json(record);
   } catch (error) {
@@ -265,8 +180,8 @@ app.get('/api/:collection/:id', (req, res, next) => {
 
 app.patch('/api/:collection/:id', (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    store.findCollection(req.params.collection);
+    const record = store.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const nextData = { ...record, ...req.body };
     delete nextData.id;
@@ -275,8 +190,8 @@ app.patch('/api/:collection/:id', (req, res, next) => {
     delete nextData.updatedAt;
     const status = nextData.status || record.status;
     nextData.status = status;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    store.saveRecord(req.params.collection, req.params.id, nextData, status);
+    store.insertEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || '更新',
@@ -285,7 +200,7 @@ app.patch('/api/:collection/:id', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    res.json(store.loadRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
@@ -293,8 +208,8 @@ app.patch('/api/:collection/:id', (req, res, next) => {
 
 app.post('/api/:collection/:id/events', (req, res, next) => {
   try {
-    const collectionConfig = findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    const collectionConfig = store.findCollection(req.params.collection);
+    const record = store.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
     const status = req.body.status || record.status;
     if (collectionConfig.statuses && !collectionConfig.statuses.includes(status)) {
@@ -305,8 +220,8 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
     delete nextData.collection;
     delete nextData.createdAt;
     delete nextData.updatedAt;
-    saveRecord(req.params.collection, req.params.id, nextData, status);
-    insertEvent({
+    store.saveRecord(req.params.collection, req.params.id, nextData, status);
+    store.insertEvent({
       recordId: req.params.id,
       collection: req.params.collection,
       action: req.body.action || status || '记录',
@@ -315,7 +230,7 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
       note: req.body.note || '',
       data: req.body
     });
-    res.json(loadRecord(req.params.collection, req.params.id));
+    res.json(store.loadRecord(req.params.collection, req.params.id));
   } catch (error) {
     next(error);
   }
@@ -323,21 +238,10 @@ app.post('/api/:collection/:id/events', (req, res, next) => {
 
 app.get('/api/:collection/:id/timeline', (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    const record = loadRecord(req.params.collection, req.params.id);
+    store.findCollection(req.params.collection);
+    const record = store.loadRecord(req.params.collection, req.params.id);
     if (!record) return res.status(404).json({ error: 'not found' });
-    const events = select(
-      'SELECT * FROM events WHERE record_id = ' + sqlValue(req.params.id) + ' ORDER BY created_at ASC;'
-    ).map((event) => ({
-      id: event.id,
-      action: event.action,
-      status: event.status,
-      actor: event.actor,
-      note: event.note,
-      data: JSON.parse(event.data || '{}'),
-      createdAt: event.created_at
-    }));
-    res.json({ record, events });
+    res.json({ record, events: store.listEvents(req.params.id) });
   } catch (error) {
     next(error);
   }
@@ -345,9 +249,8 @@ app.get('/api/:collection/:id/timeline', (req, res, next) => {
 
 app.delete('/api/:collection/:id', (req, res, next) => {
   try {
-    findCollection(req.params.collection);
-    runSql('DELETE FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' AND id = ' + sqlValue(req.params.id) + ';');
-    runSql('DELETE FROM events WHERE record_id = ' + sqlValue(req.params.id) + ';');
+    store.findCollection(req.params.collection);
+    store.deleteRecord(req.params.collection, req.params.id);
     res.status(204).end();
   } catch (error) {
     next(error);
@@ -355,9 +258,24 @@ app.delete('/api/:collection/:id', (req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
+  if (error instanceof correctionService.ServiceError) {
+    const body = { error: error.message };
+    if (error.correctionId) body.correctionId = error.correctionId;
+    return res.status(error.status || 400).json(body);
+  }
   res.status(error.status || 500).json({ error: error.message || 'server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(config.title + ' API running at http://localhost:' + PORT);
+async function start() {
+  await db.init();
+  store.initDb();
+  correctionStore.initCorrections();
+  app.listen(PORT, () => {
+    console.log(config.title + ' API running at http://localhost:' + PORT);
+  });
+}
+
+start().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });

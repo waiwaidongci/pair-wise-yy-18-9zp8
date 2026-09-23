@@ -26,18 +26,51 @@ module.exports = {
       titleFields: ['repairType', 'handler']
     },
     tourBoxes: {
-      label: '巡演装箱单',
       defaultStatus: '草稿',
-      statuses: ['草稿', '已装箱', '巡演中', '返场清点中', '已闭环'],
+      statuses: ['草稿', '已装箱', '巡演中', '返场清点中', '待复核', '已闭环'],
       required: ['showName', 'venue', 'play', 'headIds', 'accessoryIds'],
       titleFields: ['showName', 'play']
     },
     lossReports: {
       label: '缺损追踪',
       defaultStatus: '待处理',
-      statuses: ['待处理', '修复中', '已补齐', '确认为遗失'],
+      statuses: ['待处理', '修复中', '待复核', '已补齐', '确认为遗失'],
       required: ['tourBoxId', 'itemType', 'itemName', 'problem'],
       titleFields: ['itemName', 'problem']
+    }
+  },
+  // 纠错单配置：哪些档案的哪些字段允许纠错，以及通过后的联动
+  corrections: {
+    label: '档案纠错单',
+    statuses: ['待审', '已通过', '已退回'],
+    reviewStatus: '待复核',
+    // 允许发起纠错的档案与字段
+    targets: {
+      puppetHeads: {
+        fields: {
+          play: { label: '剧目' },
+          role: { label: '角色' },
+          boxNo: { label: '箱号' }
+        }
+      },
+      accessories: {
+        fields: {
+          play: { label: '剧目' },
+          role: { label: '角色' },
+          boxNo: { label: '箱号' }
+        }
+      }
+    },
+    // 尚未结束的单据：终态之外一律在纠错通过后转待复核
+    unfinished: {
+      tourBoxes: {
+        terminal: ['已闭环'],
+        refs: { headIds: 'puppetHeads', accessoryIds: 'accessories' }
+      },
+      lossReports: {
+        terminal: ['已补齐', '确认为遗失'],
+        via: { tourBoxId: 'tourBoxes' }
+      }
     }
   },
   seed: [
@@ -71,6 +104,8 @@ module.exports = {
   examples: [
     'GET /api/puppetHeads?play=火焰山&status=可演出 查询某剧目可用偶头',
     'POST /api/tourBoxes 创建巡演装箱单',
-    'POST /api/lossReports 登记返场缺损或遗失'
+    'POST /api/lossReports 登记返场缺损或遗失',
+    'POST /api/corrections 提交档案纠错单（剧目/角色/箱号）',
+    'POST /api/corrections/:id/approve 审核通过纠错单'
   ]
 };
