@@ -28,17 +28,27 @@ module.exports = {
     tourBoxes: {
       label: '巡演装箱单',
       defaultStatus: '草稿',
-      statuses: ['草稿', '已装箱', '巡演中', '返场清点中', '已闭环'],
+      statuses: ['草稿', '已装箱', '巡演中', '返场清点中', '待复核', '已闭环'],
       required: ['showName', 'venue', 'play', 'headIds', 'accessoryIds'],
       titleFields: ['showName', 'play']
     },
     lossReports: {
       label: '缺损追踪',
       defaultStatus: '待处理',
-      statuses: ['待处理', '修复中', '已补齐', '确认为遗失'],
+      statuses: ['待处理', '修复中', '待复核', '已补齐', '确认为遗失'],
       required: ['tourBoxId', 'itemType', 'itemName', 'problem'],
       titleFields: ['itemName', 'problem']
     }
+  },
+  // 允许走纠错单修改的档案字段；其他字段（如机关状态）不在此列。
+  correctionFields: {
+    puppetHeads: ['play', 'role', 'boxNo'],
+    accessories: ['play', 'role', 'boxNo']
+  },
+  // 纠错通过时需要转待复核的下游单据；已闭环/已完成类状态不动。
+  cascadeReview: {
+    tourBoxes: { activeStatuses: ['草稿', '已装箱', '巡演中', '返场清点中'] },
+    lossReports: { activeStatuses: ['待处理', '修复中'] }
   },
   seed: [
     {
@@ -71,6 +81,8 @@ module.exports = {
   examples: [
     'GET /api/puppetHeads?play=火焰山&status=可演出 查询某剧目可用偶头',
     'POST /api/tourBoxes 创建巡演装箱单',
-    'POST /api/lossReports 登记返场缺损或遗失'
+    'POST /api/lossReports 登记返场缺损或遗失',
+    'POST /api/corrections 提交偶头/配件剧目角色箱号纠错单（附凭证）',
+    'POST /api/corrections/:id/approve 审核通过：新值生效、旧值留痕、在途单据转待复核'
   ]
 };
